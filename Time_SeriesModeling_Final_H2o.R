@@ -1,0 +1,812 @@
+## Time Series Modeling
+
+# Install required Libraries if necessary
+list.of.packages <- c("caret", "dplyr","Boruta","mlbench",
+                      "tidyr","fUnitRoots","FitAR","forecast",
+                      "stringr","Metrics","tictoc","MLmetrics","h2o","opera","urca")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+
+
+#Load required libraries
+library(lmtest)
+library("fUnitRoots")
+library(FitAR)
+library("forecast")
+library(caret)
+library(dplyr)
+library(Boruta)
+library(mlbench)
+library(tidyr)
+library(stringr)
+library(Metrics)
+library(opera)
+library(urca)
+library(tictoc)
+library(rlist)
+library(MLmetrics)
+library(doParallel) 
+library(h2o)
+
+
+
+train_KagCsv <- read.csv("Datasets/Week5/train.csv", na.strings = c("", "NA"))
+train_Kag<- as.data.frame(train_KagCsv)
+train_Kag <- train_Kag %>% mutate(Date=as.Date(Date))
+
+test_KagCsv <- read.csv("Datasets/Week5/test.csv", na.strings = c("", "NA"))
+test_Kag <- as.data.frame(test_KagCsv)
+test_Kag <- test_Kag %>% mutate(Date=as.Date(Date))
+
+sub_KagCsv <- read.csv("Datasets/Week5/submission.csv", na.strings = c("", "NA"))
+sub_Kag <- as.data.frame(sub_KagCsv)
+
+minDate <- min(train_Kag$Date)
+
+# Clean Data
+sum(train_Kag$TargetValue < 0)
+
+train_Kag$TargetValue <- ifelse(train_Kag$TargetValue<0,abs(train_Kag$TargetValue),train_Kag$TargetValue)
+sum(train_Kag$TargetValue < 0)
+
+#Add lifting to the to all Target Values to insure it is away from zero and away from constant
+lift<-10 
+train_Kag$TargetValue <-train_Kag$TargetValue +  rnorm(length(train_Kag$TargetValue),mean=lift,sd=1)
+
+train_Kag_clean <- train_Kag %>%
+  mutate(CPR=factor(paste(County,Province_State ,Country_Region,sep = "_"))) %>%
+  mutate(days = as.numeric(Date-min(Date)), Wday=factor(weekdays(Date)),month=factor(as.numeric(format(Date,"%m"))))
+levels(train_Kag_clean$Wday) <-c(6,2,7,1,5,3,4) # Start from sunday =1
+
+train_Kag_clean%>% head(10)%>% knitr::kable()
+
+test_Kag_clean <- test_Kag %>%
+  mutate(CPR=factor(paste(County,Province_State ,Country_Region,sep = "_"))) %>%
+  mutate(days = as.numeric(Date-min(Date)), Wday=factor(weekdays(Date)),month=factor(as.numeric(format(Date,"%m"))))
+levels(test_Kag_clean$Wday) <-c(6,2,7,1,5,3,4) # Start from sund =1
+
+test_Kag_clean%>% head(10) %>% knitr::kable()
+
+# plot confirmed cases for  one region
+Conf_US <- train_Kag_clean %>% dplyr::filter(Target=="ConfirmedCases" & CPR=="NA_NA_Italy") %>% 
+  group_by(CPR,Date) %>% summarise(TargetValue=sum(TargetValue)) %>%
+  select(Date,TargetValue)
+par(mar = c(2, 2, 2, 2))
+plot(Conf_US$Date,Conf_US$TargetValue)
+
+# plot Fat cases for  one region
+Fat_US<-train_Kag_clean %>% dplyr::filter(Target=="Fatalities" & CPR=="NA_NA_Italy") %>% 
+  group_by(CPR,Date) %>% summarise(TargetValue=sum(TargetValue)) %>%
+  select(Date,TargetValue)
+plot(Fat_US$Date,Fat_US$TargetValue)
+
+
+# Split Kaggle train Data for local train test
+ForecastDate <- as.Date("2020-05-08") # one weeks forecast 
+StartDate <- as.Date("2020-03-01") # since there is a tall tail at the begining for most counties
+indx <- train_Kag_clean$Date < ForecastDate & train_Kag_clean$Date>StartDate
+ts_indx <-train_Kag_clean$Date > ForecastDate 
+train <- train_Kag_clean[indx,]
+test <- train_Kag_clean[ts_indx,]
+
+# Split Confirmed and Fatality cases and add accumulated sum
+train_Conf <- train %>% dplyr::filter(Target=="ConfirmedCases") %>% 
+  group_by(CPR) %>% mutate(accSum=cumsum(TargetValue))%>% ungroup()
+
+train_Fat <- train %>% dplyr::filter(Target=="Fatalities") %>% 
+  group_by(CPR) %>% mutate(accSum=cumsum(TargetValue))%>% ungroup()
+
+test_Conf <- test%>% dplyr::filter(Target=="ConfirmedCases") %>% 
+  group_by(CPR) %>% mutate(accSum=cumsum(TargetValue))%>% ungroup()
+
+test_Fat <- test %>% dplyr::filter(Target=="Fatalities") %>% 
+  group_by(CPR) %>% mutate(accSum=cumsum(TargetValue))%>% ungroup()
+
+# Lets see top 10 Confirmed cases county
+top10 <- train_Conf %>% group_by(CPR) %>% summarise(TargetValue=sum(TargetValue)) %>% 
+  arrange(desc(TargetValue)) %>% dplyr::filter(str_detect(CPR,"_US\\b"))%>% head(10)
+top10%>% knitr::kable()
+
+# Lets View Bottom 10 with at least 100 Target Value
+bot10 <- train_Conf%>% dplyr::filter(TargetValue > 100)  %>% group_by(CPR) %>% summarise(TargetValue=sum(TargetValue)) %>% 
+  arrange(TargetValue) 
+bot10%>% knitr::kable()
+######################################
+# Case study US Confirmed cases
+
+train_Conf_USA <- train_Conf %>% dplyr::filter(CPR=="NA_NA_US") 
+#View(train_Conf_USA%>%head(10))
+
+test_Conf_USA <- test_Conf %>% dplyr::filter(CPR=="NA_NA_US") 
+#View(train_Conf_USA)
+
+train_Fat_USA <- train_Fat %>% dplyr::filter(CPR=="NA_NA_US")
+test_Fat_USA <- test_Fat %>% dplyr::filter(CPR=="NA_NA_US")
+
+tsTrConf<- ts(select(data.frame(train_Conf_USA),TargetValue),start=c(2020,3,1),frequency = 365) # consider  weekly data
+
+plot(tsTrConf)
+
+
+#detemine stationarity of data by urkpss Test
+
+my_urkpssTest <- function (x, type, lags, use.lag, doplot) {
+  x <- as.vector(x)
+  urca <- urca::ur.kpss(x, type = type[1], lags = lags[1], use.lag = use.lag)
+  output = capture.output(urca::summary(urca))[-(1:4)]
+  output = output[-length(output)]
+  for (i in 1:length(output)) output[i] = paste(" ", output[i])
+  ans = list(name = "ur.kpss", test = urca, output = output)
+  if (doplot) 
+    #plot(urca)
+  new("fHTEST", call = match.call(), data = list(x = x), 
+      test = ans, title = "KPSS Unit Root Test", description = description())
+}
+
+my_urkpssTest(tsTrConf, type = c("tau"), lags = c("long"),
+              use.lag = NULL, doplot = TRUE)
+# From the results it is clear that "Value of test-statistic" > "Critical value for a significance level of 5%"
+# Thus the null hypothesis of stationarity is rejected. 
+
+tsstationary<-diff(tsTrConf, differences=1)
+plot(tsstationary)
+acf(tsTrConf,lag.max=34)
+
+######
+
+## Feature Selection Analysis
+train_Con_dt<-select(train_Conf_USA,TargetValue,Date,days,Wday)
+train_Fat_dt<-select(train_Fat_USA,TargetValue,Date,days,Wday)
+# We Can Use Boruta library to rank features
+set.seed(2020)
+Br_Con <- Boruta(TargetValue ~., data=train_Con_dt, doTrace=2, maxRuns=50)
+print(Br_Con)
+
+plot(Br_Con,las=2,cex.axis=0.7) # las: to make lables vertical, cex.axis for scaling view
+
+# We can see that only the Day and days features are important for estimating TargetValue in Confirmed Cases
+# Now lets explore Fatality cases
+set.seed(2020)
+Br_Fat <- Boruta(TargetValue ~., data=train_Fat_dt, doTrace=2, maxRuns=50)
+print(Br_Fat)
+
+plot(Br_Fat,las=2,cex.axis=0.7) # las: to make lables vertical, cex.axis for scaling view
+#We get approximately the same results on Fatality cases
+
+
+#########################################################
+#############################
+## Modeleling
+Location <- "US"
+fit <- auto.arima(select(data.frame(train_Con_dt) ,TargetValue))
+acc<- forecast::accuracy(fit)
+acc
+training_Con_RMSE<-acc[1,2]
+
+
+Forc <- forecast(fit,h=nrow(test_Conf_USA))
+plot(Forc)
+# calculate RMSE
+ForcMean<- as.numeric(Forc$mean)
+Conf_RMSE<-rmse(ForcMean,test_Conf_USA$TargetValue) 
+Conf_R2 <-R2_Score(ForcMean,test_Conf_USA$TargetValue)
+
+fit <- auto.arima(select(data.frame(train_Fat_dt) ,TargetValue))
+Forc <- forecast(fit,h=nrow(test_Fat_USA))
+par(mar=c(2,2,2,2))
+plot(Forc)
+# calculate RMSE
+ForcMean<- as.numeric(Forc$mean)
+Fat_RMSE<-rmse(ForcMean,test_Fat_USA$TargetValue) #1800.502
+Fat_R2 <-R2_Score(ForcMean,test_Fat_USA$TargetValue)
+
+# Show RMSE results
+rmse_results <- tibble(Method = "Auto-ARIMA", Conf_RMSE = Conf_RMSE, Fat_RMSE=Fat_RMSE,Conf_R2=Conf_R2,Fat_R2=Fat_R2, Location=Location)
+rmse_results %>% knitr::kable()
+
+
+##########################################################
+## Using H2O library to perform the task in parallel way
+h2o.init(nthreads = 2, #Number of threads -1 means use all cores on your machine
+                         max_mem_size = "7G")  #max mem size is the maximum memory to allocate to H2O
+
+train_Con_h2o <- as.h2o(train_Con_dt)
+train_Fat_h2o <- as.h2o(train_Fat_dt)
+test_Conf_h2o<-as.h2o(test_Conf_USA)
+test_Fat_h2o <- as.h2o(test_Fat_USA)
+
+x<-"days"
+y<-"TargetValue"
+nfolds<-5
+# fit rf model
+rf_model_Con_h2o<- h2o.randomForest(x = x,
+                                y = y,
+                                training_frame = train_Con_h2o,
+                                ntrees = 50,
+                                nfolds = nfolds,
+                                keep_cross_validation_predictions = TRUE,
+                                seed = 1)
+
+Prd <- h2o.predict(rf_model_Con_h2o,newdata = test_Conf_h2o)
+perf <- h2o.performance(rf_model_Con_h2o, newdata = test_Conf_h2o)
+print(perf)
+Conf_RMSE <- perf@metrics[["RMSE"]]
+Conf_R2<-perf@metrics[["r2"]]
+
+############# Fiting Fatalities############
+rf_model_Fat_h2o<- h2o.randomForest(x = x,
+                                    y = y,
+                                    training_frame = train_Fat_h2o,
+                                    ntrees = 50,
+                                    nfolds = nfolds,
+                                    keep_cross_validation_predictions = TRUE,
+                                    seed = 1)
+
+
+Prd <- h2o.predict(rf_model_Fat_h2o,newdata = test_Fat_h2o)
+perf <- h2o.performance(rf_model_Fat_h2o, newdata = test_Fat_h2o)
+print(perf)
+Fat_RMSE <- perf@metrics[["RMSE"]]
+Fat_R2<-perf@metrics[["r2"]]
+# Show RMSE results
+rmse_results <- rbind(rmse_results,tibble(Method = perf@algorithm, Conf_RMSE = Conf_RMSE,Conf_R2=Conf_R2, Fat_RMSE=Fat_RMSE,Fat_R2=Fat_R2, Location=Location))
+rmse_results %>%  knitr::kable()
+
+
+###########################################################
+# Train & Cross-validate a Gradient Boosting Machine
+gbm_model_Con_h2o <- h2o.gbm(x = x,
+                  y = y,
+                  training_frame = train_Con_h2o,
+                  ntrees = 10,
+                  max_depth = 3,
+                  min_rows = 2,
+                  learn_rate = 0.2,
+                  nfolds = nfolds,
+                  keep_cross_validation_predictions = TRUE,
+                  seed = 1)
+Prd <- h2o.predict(gbm_model_Con_h2o,newdata = test_Conf_h2o)
+perf <- h2o.performance(gbm_model_Con_h2o, newdata = test_Conf_h2o)
+print(perf)
+Conf_RMSE <- perf@metrics[["RMSE"]]
+Conf_R2<-perf@metrics[["r2"]]
+###### Fit Fatalities
+gbm_model_Fat_h2o <- h2o.gbm(x = x,
+                             y = y,
+                             training_frame = train_Fat_h2o,
+                             ntrees = 10,
+                             max_depth = 3,
+                             min_rows = 2,
+                             learn_rate = 0.2,
+                             nfolds = nfolds,
+                             keep_cross_validation_predictions = TRUE,
+                             seed = 1)
+Prd <- h2o.predict(gbm_model_Fat_h2o,newdata = test_Fat_h2o)
+perf <- h2o.performance(gbm_model_Fat_h2o, newdata = test_Fat_h2o)
+print(perf)
+Fat_RMSE <- perf@metrics[["RMSE"]]
+Fat_R2<-perf@metrics[["r2"]]
+
+# Show RMSE results
+rmse_results <- rbind(rmse_results,tibble(Method = perf@algorithm, Conf_RMSE = Conf_RMSE,Conf_R2=Conf_R2, Fat_RMSE=Fat_RMSE,Fat_R2=Fat_R2, Location=Location))
+rmse_results %>%  knitr::kable()
+### Generalized Linear regression
+glm_model_Con_h2o <- h2o.glm(x = x,
+                             y = y,
+                             nfolds = nfolds,
+                             alpha=0.5,
+                             training_frame = train_Con_h2o,
+                             keep_cross_validation_predictions = TRUE,
+                             seed = 1)
+
+Prd <- h2o.predict(glm_model_Con_h2o,newdata = test_Conf_h2o)
+perf <- h2o.performance(glm_model_Con_h2o, newdata = test_Conf_h2o)
+print(perf)
+Conf_RMSE <- perf@metrics[["RMSE"]]
+Conf_R2<-perf@metrics[["r2"]]
+
+# Fit Fatalities
+glm_model_Fat_h2o <- h2o.glm(x = x,
+                             y = y,
+                             nfolds = nfolds,
+                             alpha=0.5,
+                             training_frame = train_Fat_h2o,
+                             keep_cross_validation_predictions = TRUE,
+                             seed = 1)
+
+Prd <- h2o.predict(glm_model_Fat_h2o,newdata = test_Fat_h2o)
+perf <- h2o.performance(glm_model_Fat_h2o, newdata = test_Fat_h2o)
+print(perf)
+Fat_RMSE <- perf@metrics[["RMSE"]]
+Fat_R2<-perf@metrics[["r2"]]
+
+# Show RMSE results
+rmse_results <- rbind(rmse_results,tibble(Method = perf@algorithm, Conf_RMSE = Conf_RMSE,Conf_R2=Conf_R2, Fat_RMSE=Fat_RMSE,Fat_R2=Fat_R2, Location=Location))
+rmse_results %>%  knitr::kable()
+######################################################################
+#Fit Stack ensembler
+
+# Train a stacked ensemble using the  above models
+ensemble_model_Con_h2o <- h2o.stackedEnsemble(x = x,
+                                y = y,
+                                training_frame = train_Con_h2o,
+                                base_models = list(glm_model_Con_h2o,gbm_model_Con_h2o,rf_model_Con_h2o))
+
+# Eval ensemble performance on a test set
+Prd <- h2o.predict(ensemble_model_Con_h2o,newdata = test_Conf_h2o)
+perf <- h2o.performance(ensemble_model_Con_h2o, newdata = test_Conf_h2o)
+print(perf)
+Conf_RMSE <- perf@metrics[["RMSE"]]
+Conf_R2<-perf@metrics[["r2"]]
+###### Fit fatalities
+# Train a stacked ensemble using the  above models
+ensemble_model_Fat_h2o <- h2o.stackedEnsemble(x = x,
+                                              y = y,
+                                              training_frame = train_Fat_h2o,
+                                              base_models = list(glm_model_Fat_h2o,gbm_model_Fat_h2o,rf_model_Fat_h2o))
+
+# Eval ensemble performance on a test set
+Prd <- h2o.predict(ensemble_model_Fat_h2o,newdata = test_Fat_h2o)
+perf <- h2o.performance(ensemble_model_Fat_h2o, newdata = test_Fat_h2o)
+print(perf)
+Fat_RMSE <- perf@metrics[["RMSE"]]
+Fat_R2<-perf@metrics[["r2"]]
+# Show RMSE results
+rmse_results <- rbind(rmse_results,tibble(Method = perf@algorithm, Conf_RMSE = Conf_RMSE,Conf_R2=Conf_R2, Fat_RMSE=Fat_RMSE,Fat_R2=Fat_R2, Location=Location))
+rmse_results %>%  knitr::kable()
+
+##################################################################
+
+## Modeling different regions with different Models by selecting 3 places from the top and 3 places from the bottom
+
+fit_Model <- function(Model,train_Con_h2o,test_Con_h2o,train_Fat_h2o, test_Fat_h2o,x="Date",y="TargetValue" )
+{
+  
+  nfolds<-5
+  # This function will take a model from caret package or "auto.arima" and return a list
+  # contains Predictions of confirmed and Fatilities in addition to the RMSE of the predictions
+  
+  
+  
+  
+  if(Model=="drf"){
+    # fit rf model
+    rf_model_Con_h2o<- h2o.randomForest(x = x,
+                                        y = y,
+                                        training_frame = train_Con_h2o,
+                                        ntrees = 50,
+                                        nfolds = nfolds,
+                                        keep_cross_validation_predictions = TRUE,
+                                        seed = 1)
+    
+    
+    #Prd_Con <- h2o.predict(rf_model_Con_h2o,newdata = test_Con_h2o)
+    perf <- h2o.performance(rf_model_Con_h2o, newdata = test_Con_h2o)
+    #print(perf)
+    Conf_RMSE <- perf@metrics[["RMSE"]]
+    Conf_R2<-perf@metrics[["r2"]]
+    
+    ############# Fiting Fatalities############
+    rf_model_Fat_h2o<- h2o.randomForest(x = x,
+                                        y = y,
+                                        training_frame = train_Fat_h2o,
+                                        ntrees = 50,
+                                        nfolds = nfolds,
+                                        keep_cross_validation_predictions = TRUE,
+                                        seed = 1)
+    
+    
+    #Prd_Fat <- h2o.predict(rf_model_Fat_h2o,newdata = test_Fat_h2o)
+    perf <- h2o.performance(rf_model_Fat_h2o, newdata = test_Fat_h2o)
+    #print(perf)
+    Fat_RMSE <- perf@metrics[["RMSE"]]
+    Fat_R2<-perf@metrics[["r2"]]
+    
+  }else if(Model=="gbm"){
+    # Train & Cross-validate a Gradient Boosting Machine
+    gbm_model_Con_h2o <- h2o.gbm(x = x,
+                                 y = y,
+                                 training_frame = train_Con_h2o,
+                                 ntrees = 10,
+                                 max_depth = 3,
+                                 min_rows = 2,
+                                 learn_rate = 0.2,
+                                 nfolds = nfolds,
+                                 keep_cross_validation_predictions = TRUE,
+                                 seed = 1)
+    #Prd_Con <- h2o.predict(gbm_model_Con_h2o,newdata = test_Con_h2o)
+    perf <- h2o.performance(gbm_model_Con_h2o, newdata = test_Con_h2o)
+    #print(perf)
+    Conf_RMSE <- perf@metrics[["RMSE"]]
+    Conf_R2<-perf@metrics[["r2"]]
+    ###### Fit Fatalities
+    gbm_model_Fat_h2o <- h2o.gbm(x = x,
+                                 y = y,
+                                 training_frame = train_Fat_h2o,
+                                 ntrees = 10,
+                                 max_depth = 3,
+                                 min_rows = 2,
+                                 learn_rate = 0.2,
+                                 nfolds = nfolds,
+                                 keep_cross_validation_predictions = TRUE,
+                                 seed = 1)
+    #Prd_Fat <- h2o.predict(gbm_model_Fat_h2o,newdata = test_Fat_h2o)
+    perf <- h2o.performance(gbm_model_Fat_h2o, newdata = test_Fat_h2o)
+    #print(perf)
+    Fat_RMSE <- perf@metrics[["RMSE"]]
+    Fat_R2<-perf@metrics[["r2"]]
+    
+  }else if(Model=="glm"){
+    
+    ### Generalized Linear regression
+    glm_model_Con_h2o <- h2o.glm(x = x,
+                                 y = y,
+                                 nfolds = nfolds,
+                                 alpha=0.5,
+                                 training_frame = train_Con_h2o,
+                                 keep_cross_validation_predictions = TRUE,
+                                 seed = 1)
+    
+    #Prd_Con <- h2o.predict(glm_model_Con_h2o,newdata = test_Con_h2o)
+    perf <- h2o.performance(glm_model_Con_h2o, newdata = test_Con_h2o)
+    #print(perf)
+    Conf_RMSE <- perf@metrics[["RMSE"]]
+    Conf_R2<-perf@metrics[["r2"]]
+    
+    # Fit Fatalities
+    glm_model_Fat_h2o <- h2o.glm(x = x,
+                                 y = y,
+                                 nfolds = nfolds,
+                                 alpha=0.5,
+                                 training_frame = train_Fat_h2o,
+                                 keep_cross_validation_predictions = TRUE,
+                                 seed = 1)
+    
+    #Prd_Fat <- h2o.predict(glm_model_Fat_h2o,newdata = test_Fat_h2o)
+    perf <- h2o.performance(glm_model_Fat_h2o, newdata = test_Fat_h2o)
+    #print(perf)
+    Fat_RMSE <- perf@metrics[["RMSE"]]
+    Fat_R2<-perf@metrics[["r2"]]
+    
+  }
+  #as.h2o(data.frame(Predicted_Confirmed=as.vector(Prd_Con),Predicted_Fatilities=as.vector(Prd_Fat))),
+  list(Conf_RMSE=Conf_RMSE,Fat_RMSE=Fat_RMSE,Conf_R2=Conf_R2, Fat_R2=Fat_R2)
+  
+}
+
+ Apply_Models<-function(Md=Mdls,tr_Con=tr_C_h2o,ts_Con=ts_C_h2o,tr_Fat=tr_F_h2o,ts_Fat=ts_F_h2o,pl=places,x="Date",y="TargetValue"){
+lapply(pl,function(p){
+  tr_Con_CPR <-  tr_Con[tr_Con[,"CPR"]==p,]
+  ts_Con_CPR  <-ts_Con[ts_Con[,"CPR"]==p ,] 
+  
+  tr_Fat_CPR <- tr_Fat[tr_Fat[,"CPR"]==p,]
+  ts_Fat_CPR <- ts_Fat[ts_Fat[,"CPR"]==p,]
+ lapply(Md,function(M){
+    fit_Model(M,tr_Con_CPR,ts_Con_CPR,tr_Fat_CPR,ts_Fat_CPR,x="Date",y="TargetValue")
+    })
+})
+}
+
+#Lets compare models on diferrent locations
+Mdls<- c("gbm","drf","glm") #, ,
+# first lets select a sample of 10% of the place where 70% are from USA
+SmpSize<-0.1*(length(unique(train_Kag_clean$CPR)))
+
+set.seed(2020)
+Sample_US <- sample(train_Conf$CPR[str_detect(train_Conf$CPR,"_US\\b")],round(SmpSize*0.7))
+set.seed(2020)
+Sample_NotUS<- sample(train_Conf$CPR[!str_detect(train_Conf$CPR,"_US\\b")],round(SmpSize*0.3))
+set.seed(2020)
+Sample_CPR <-sample(c(as.character(Sample_US) ,as.character(Sample_NotUS)))
+Sample_CPR %>%  head() %>% knitr::kable()
+places <-Sample_CPR
+# lets use H2O library to do it in parallel
+
+tr_C_h2o<-as.h2o(select(train_Conf,CPR,Date, TargetValue))
+ts_C_h2o<-as.h2o(select(test_Conf,CPR,Date, TargetValue))
+tr_F_h2o<-as.h2o(select(train_Fat,CPR,Date, TargetValue))
+ts_F_h2o<-as.h2o(select(test_Fat,CPR,Date, TargetValue))
+x<-"Date"
+y<-"TargetValue"
+
+#### this will take about an hour on modest pc
+tic("Total  time")
+#results <- Apply_Models() # I had already save the results
+load("Var/ML_Res2020-05-29_19-35.rda")# if you want to generate your own results please comment this line
+toc()
+####### Show results
+ShowResults_tbl <- function(M=Mdls,p=places, r=results){
+  RMSE_results<- tibble(Model=character(),Place=character(),Conf_RMSE=numeric(),Fat_RMSE=numeric(),Conf_R2=numeric(),Fat_R2=numeric())
+  for(j in 1:length(p)){
+    
+    for (i in 1:length(M)){
+      RMSE_results <- bind_rows(RMSE_results,tibble( Model = M[i],Place=p[j], Conf_RMSE=r[[j]][[i]][["Conf_RMSE"]], Fat_RMSE=r[[j]][[i]][["Fat_RMSE"]],Conf_R2 = r[[j]][[i]][["Conf_R2"]], Fat_R2=r[[j]][[i]][["Fat_R2"]] ))
+    }
+    #RMSE_results <- bind_rows(RMSE_results,tibble( Model = "---------",Place="---------",Conf_RMSE=0000000,Fat_RMSE=000000, Conf_R2 = 0000000, Fat_R2=000000 ))
+  }
+  
+  RMSE_results 
+}
+#Res_clean<-ShowResults_tbl() # if you want to generate your own results uncomment this tag
+
+##### Save result to file 
+#current_DT<-format(Sys.time(), "%Y-%m-%d_%H-%M")
+#Resfile<- paste0("Var/ML_Res",current_DT,".rda")
+#save(Res_clean,results , file = Resfile)
+#########################################################################
+
+########################################################################
+Res_clean %>% head() %>% knitr::kable()
+
+Res_clean %>%  select(Place,Model,Conf_R2) %>% arrange(Place,desc(Conf_R2))%>% knitr::kable()
+Res_clean %>%  select(Place,Model,Fat_R2) %>%arrange(Place,desc(Fat_R2))%>% knitr::kable()
+# From the results one can infere that there is no model always giving the best R- score
+
+# Lets see which model has the Highest average R2 score
+Res_clean %>%  select(Place,Model,Conf_R2) %>% group_by (Model)%>%
+  summarise(Conf_R2=sum(Conf_R2)/n())%>% arrange(desc(Conf_R2))%>% knitr::kable()
+
+Res_clean %>% select(Place,Model,Fat_R2) %>% group_by (Model)%>%
+  summarise(Fat_R2=sum(Fat_R2)/n())%>% arrange(desc(Fat_R2))%>% knitr::kable()
+
+# It is obvious that  Gradient Boosting Machine Model has the best Average R-Score for both 
+# Confirmed cases and Fatality cases
+
+
+######################### Final Training
+#Now lets train Gradient Boosting Machine on the whole training set 
+#h2o.init(nthreads = -1,max_mem_size = "7G")  #max mem size is the maximum memory to allocate to H2O
+ #Number of threads -1 means use all cores on your machine
+## Prediction Function
+Predic_gbm <- function(train_Con_h2o,test_Con_h2o,train_Fat_h2o, test_Fat_h2o,x="Date",y="TargetValue" )
+{
+  
+  
+  nfolds<-5
+  
+  # Train & Cross-validate a Gradient Boosting Machine
+  gbm_model_Con_h2o <- h2o.gbm(x = x,
+                               y = y,
+                               training_frame = train_Con_h2o,
+                               ntrees = 10,
+                               max_depth = 3,
+                               min_rows = 2,
+                               learn_rate = 0.2,
+                               nfolds = nfolds,
+                               keep_cross_validation_predictions = TRUE,
+                               seed = 1)
+  
+  Prd_Con <-h2o.predict(gbm_model_Con_h2o,newdata = test_Con_h2o)
+  #Mean Absolute Error
+  mae_Con <-gbm_model_Con_h2o@model[["training_metrics"]]@metrics[["mae"]]
+  RMSE_Con <-gbm_model_Con_h2o@model[["training_metrics"]]@metrics[["RMSE"]]
+  ###### Fit Fatalities
+  gbm_model_Fat_h2o <- h2o.gbm(x = x,
+                               y = y,
+                               training_frame = train_Fat_h2o,
+                               ntrees = 10,
+                               max_depth = 3,
+                               min_rows = 2,
+                               learn_rate = 0.2,
+                               nfolds = nfolds,
+                               keep_cross_validation_predictions = TRUE,
+                               seed = 1)
+  
+  Prd_Fat <- h2o.predict(gbm_model_Fat_h2o,newdata = test_Fat_h2o)
+  ##Mean Absolute Error
+  mae_Fat<-gbm_model_Fat_h2o@model[["training_metrics"]]@metrics[["mae"]]
+  RMSE_Fat <-gbm_model_Fat_h2o@model[["training_metrics"]]@metrics[["RMSE"]]
+  list(data.frame(Predicted_Confirmed=as.vector(Prd_Con),Predicted_Fatilities=as.vector(Prd_Fat)),mae_Con=mae_Con,mae_Fat=mae_Fat, RMSE_Con=RMSE_Con,RMSE_Fat=RMSE_Fat)
+  
+}
+Apply_CPR<-function(tr_Con=tr_C_h2o,ts_Con=ts_C_h2o,tr_Fat=tr_F_h2o,ts_Fat=ts_F_h2o,pl=places,x="Date",y="TargetValue"){
+  #tr=train
+  #ts=test
+  #pl= places
+  #Md=Mdls
+  # register parallel processing with all cores
+  #cl <- makeCluster(detectCores(), type='PSOCK')
+  #registerDoParallel(cl)
+  lapply(pl,function(p){
+    tr_Con_CPR <-  tr_Con[tr_Con[,"CPR"]==p,]
+    ts_Con_CPR  <-ts_Con[ts_Con[,"CPR"]==p ,] 
+    
+    tr_Fat_CPR <- tr_Fat[tr_Fat[,"CPR"]==p,]
+    ts_Fat_CPR <- ts_Fat[ts_Fat[,"CPR"]==p,]
+
+      Predic_gbm(tr_Con_CPR,ts_Con_CPR,tr_Fat_CPR,ts_Fat_CPR,x="Date",y="TargetValue")
+    })
+
+  
+  # turn parallel processing off and run sequentially again:
+  #registerDoSEQ() 
+}
+
+
+train_Kag_Con<- train_Kag_clean %>% dplyr::filter(Target=="ConfirmedCases")
+test_Kag_Con<- test_Kag_clean %>% dplyr::filter(Target=="ConfirmedCases")
+
+train_Kag_Fat <-train_Kag_clean %>% dplyr::filter(Target=="Fatalities")
+test_Kag_Fat <-test_Kag_clean %>% dplyr::filter(Target=="Fatalities")
+
+tr_C_h2o<-as.h2o(select(train_Kag_Con,CPR,Date, TargetValue))
+ts_C_h2o<-as.h2o(select(test_Kag_Con,CPR,Date))
+tr_F_h2o<-as.h2o(select(train_Kag_Fat,CPR,Date, TargetValue))
+ts_F_h2o<-as.h2o(select(test_Kag_Fat,CPR,Date))
+x<-"Date"
+y<-"TargetValue"
+
+All_CPR<-   as.vector(unique(test_Kag_clean$CPR))
+places<-All_CPR
+#### this will take about an hour on modest pc
+tic("Total  time")
+#gmb_Res <- Apply_CPR() # I had already save the results
+load("Var/gmb_Res2020-05-30_19-17.rda")# if you want to generate your own results please comment this line
+toc() #Total  time: 5543.53 sec elapsed
+
+##### Save result to file 
+#current_DT<-format(Sys.time(), "%Y-%m-%d_%H-%M")
+#Resfile<- paste0("Var/gmb_Res",current_DT,".rda")
+#save(gmb_Res , file = Resfile)
+
+#### Process Prediction Results
+
+predicted_results<- tibble(ForecastId=numeric(),CPR=character(),ConfirmedCases=numeric(),Fatalities=numeric(),mae_Con=numeric(),mae_Fat=numeric())
+Predlength<-length(gmb_Res[[1]][[1]][["Predicted_Confirmed"]])
+for(i in 1:length(gmb_Res)){
+  CPR_i<- rep(All_CPR[i],Predlength)
+    predicted_results <- bind_rows(predicted_results,tibble(ForecastId=i,
+                                                            CPR=CPR_i,
+                                                            ConfirmedCases=gmb_Res[[i]][[1]][["Predicted_Confirmed"]],
+                                                            Fatalities=gmb_Res[[i]][[1]][["Predicted_Fatilities"]],
+                                   mae_Con=rep(gmb_Res[[i]][["mae_Con"]],Predlength),
+                                   mae_Fat=rep(gmb_Res[[i]][["mae_Fat"]],Predlength)))
+  
+}
+
+predicted <- predicted_results %>% pivot_longer(c("ConfirmedCases","Fatalities"), names_to = "Target", values_to = "TargetValue") %>%
+  arrange(ForecastId) %>% mutate(ForecastId=seq(1:nrow(.))) %>% left_join(select(test_Kag,Date,ForecastId), by="ForecastId")
+predicted <-as.data.frame(predicted)
+ # adjust columns to be according to the follwing structure "ForecastId", "q_0.05","q_0.5","q_0.95"
+### use mid quantile only for predicted data
+Predicted_C <- predicted %>% dplyr::filter(Target=="ConfirmedCases") %>%
+  select(ForecastId,mae_Con,TargetValue,Date)%>% 
+  mutate(q_0.05=qnorm(0.05,TargetValue,mae_Con),
+         q_0.5=TargetValue,
+         q_0.95=qnorm(0.95,TargetValue,mae_Con))%>%
+  select(-mae_Con,-TargetValue)
+
+Predicted_F <- predicted %>% dplyr::filter(Target=="Fatalities") %>%
+  select(ForecastId,mae_Fat,TargetValue,Date)%>% 
+  mutate(q_0.05=qnorm(0.05,TargetValue,mae_Fat),
+         q_0.5=TargetValue,
+         q_0.95=qnorm(0.95,
+                      TargetValue,mae_Fat))%>%
+  select(-mae_Fat,-TargetValue)
+
+#############################################
+#Evaluate using Pinball evaluation
+
+#Pinball evaluation performance
+
+pinball <- function(true_array, predicted_array, tau, weight){
+  array <- predicted_array * (predicted_array > 0)
+  abs_diff <- abs(true_array - array)
+  result <- abs_diff * (1 -tau) * (array > true_array) + abs_diff * (tau) * (array <= true_array)
+  result <- (mean(result)) * weight
+  return (mean(result))
+}
+Avg_loss<- function(true_array, mean_array, min_array, max_array, weights){
+  result <- (pinball(true_array, max_array, 0.95, weights) + 
+               pinball(true_array, min_array, 0.05, weights) + 
+               pinball(true_array, mean_array, 0.5, weights))
+  return (result / 3)
+}
+# Dates intersection between training and testing
+minDate<-min(test_Kag$Date)
+maxDate<-max(train_Kag$Date)
+# Actual Values from original Trian Kaggle Dataset 
+TargetVal_C_trained <- train_Kag %>% dplyr::filter(Target=="ConfirmedCases" & Date>= minDate)%>% .$TargetValue
+TargetVal_F_trained <- train_Kag %>% dplyr::filter (Target=="Fatalities" & Date>= minDate) %>% .$TargetValue
+
+weights_C <-train_Kag %>% dplyr::filter(Target=="ConfirmedCases" & Date>= minDate)%>% .$Weight
+weights_F <-train_Kag %>% dplyr::filter(Target=="Fatalities" & Date>= minDate)%>% .$Weight
+
+# prepare masks for intersection period between training and testing
+Prd_Dt_Msk_C<- Predicted_C[,"Date"]<= maxDate & Predicted_C[,"Date"]>= minDate
+Prd_Dt_Msk_F<- Predicted_F[,"Date"]<= maxDate & Predicted_F[,"Date"]>= minDate
+
+# Pinball results for Confirmed Cases
+Pinball_Results_Con <- Avg_loss(TargetVal_C_trained,
+                                Predicted_C[Prd_Dt_Msk_C,]$q_0.5,
+                                Predicted_C[Prd_Dt_Msk_C,]$q_0.05,
+                                Predicted_C[Prd_Dt_Msk_C,]$q_0.95,
+                                weights_C)
+print(paste("Pinball Result for Confirmed Cases:",Pinball_Results_Con))
+
+# Pinball Results for Fatalities
+Pinball_Results_Fat <- Avg_loss(TargetVal_F_trained,
+                                Predicted_F[Prd_Dt_Msk_F,]$q_0.5,
+                                Predicted_F[Prd_Dt_Msk_F,]$q_0.05,
+                                Predicted_F[Prd_Dt_Msk_F,]$q_0.95,
+                                weights_F)
+print(paste("Pinball Result for Fatality  Cases:",Pinball_Results_Fat))
+
+######################### Plot Prediction Results
+# Italy Results
+Italy_C_IdDate<-test_Kag %>% dplyr::filter(Country_Region=="Italy" & Target=="ConfirmedCases" & Date <=maxDate) %>% select(ForecastId,Date)
+Italy_F_IdDate<-test_Kag %>% dplyr::filter(Country_Region=="Italy" & Target=="Fatalities" & Date <=maxDate) %>% select(ForecastId,Date)
+
+Italy_C_test<-train_Kag %>% dplyr::filter(Country_Region=="Italy" & Target=="ConfirmedCases" & Date >=minDate) %>% select(TargetValue,Date)
+Italy_F_test<-train_Kag %>% dplyr::filter(Country_Region=="Italy" & Target=="Fatalities"& Date >=minDate) %>% select(TargetValue,Date)
+
+Prd_It_C<-Predicted_C%>% select(-Date)%>%inner_join(Italy_C_IdDate, by="ForecastId") 
+Prd_It_F<-Predicted_F%>% select(-Date)%>%inner_join(Italy_F_IdDate, by="ForecastId") 
+
+ggplot(aes(x=Date), data=Prd_It_C) +
+  geom_line(aes(y=q_0.5), col="blue",data=Prd_It_C) +
+  geom_line(aes(y=TargetValue), data =Italy_C_test, col="red" ) +
+  labs(colour="TargetValue", 
+       x="Date",
+       y="Confirmed Cases") +
+  scale_color_manual(name="", values = c("red","blue")) +
+  scale_fill_manual(name="", values=c("red","blue"))+
+  ggtitle("Actual vs Prediction For Italy confirmed cases") 
+  
+ggplot(aes(x=Date), data=Prd_It_F) +
+  geom_line(aes(y=q_0.5), col="blue",data=Prd_It_F) +
+  geom_line(aes(y=TargetValue), data =Italy_F_test, col="red" ) +
+  labs(colour="TargetValue", 
+       x="Date",
+       y="Fatality Cases") +
+  scale_color_manual(name="", values = c("red","blue")) +
+  scale_fill_manual(name="", values=c("red","blue"))+
+  ggtitle("Actual vs Prediction For Italy Fatality cases") 
+
+  
+
+
+
+
+#################### Set training Targeet Values to their original known values
+Predicted_C[Prd_Dt_Msk_C,]$q_0.5 <-TargetVal_C_trained
+Predicted_C[Prd_Dt_Msk_C,]$q_0.05 <-TargetVal_C_trained
+Predicted_C[Prd_Dt_Msk_C,]$q_0.95 <-TargetVal_C_trained
+
+Predicted_F[Prd_Dt_Msk_F,]$q_0.5 <-TargetVal_F_trained
+Predicted_F[Prd_Dt_Msk_F,]$q_0.05 <-TargetVal_F_trained
+Predicted_F[Prd_Dt_Msk_F,]$q_0.95 <-TargetVal_F_trained
+
+
+#########################################################
+## Submit Results 
+
+# Submission function 
+Submit  <- function(test_c,test_f){
+#test_c <-Predicted_C
+#test_f <- Predicted_F
+  # expected test_x to have "ForecastId", "q_0.05","q_0.5","q_0.95" columns
+  test_full <- rbind.data.frame(test_c,test_f) %>% select(ForecastId,q_0.05,q_0.5,q_0.95) %>%
+    "colnames<-"(c("Id", "0.05","0.5","0.95")) %>% arrange(Id)
+  
+  # prepare and join submission dataset
+  sub_temp <- sub_Kag %>% separate(ForecastId_Quantile,c("Id","q"),"_")  %>%
+    pivot_wider(names_from=q,values_from=TargetValue ) %>% select(Id) %>% mutate(Id=as.numeric(Id)) %>%
+  left_join(test_full, by="Id") %>% 
+    pivot_longer("0.05":"0.95",names_to = "Quantile",values_to = "TargetValue") %>%
+    mutate(Id=as.character(Id)) %>%unite("_", Id:Quantile) %>% rename("ForecastId_Quantile"="_")
+  
+  current_DT<-format(Sys.time(), "%Y-%m-%d_%H-%M")
+  Subfile<- paste0("Output/submission",current_DT,".csv")
+  write.csv(sub_temp,Subfile,row.names = FALSE)
+}
+
+####################################################
+Submit(select(Predicted_C,-Date),select(Predicted_F,-Date))
+
+#################################################
+# shutdown H2o Server
+h2o.shutdown(prompt = TRUE)
+
+
+
